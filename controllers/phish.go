@@ -22,7 +22,6 @@ import (
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 	"github.com/jordan-wright/unindexed"
-	bm "github.com/microcosm-cc/bluemonday"
 )
 
 // ErrInvalidRequest is thrown when a request with an invalid structure is
@@ -89,10 +88,6 @@ func WithContactAddress(addr string) PhishingServerOption {
 func customError(w http.ResponseWriter, error string, code int) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-XSS-Protection" "1; mode=block")
-	w.Header().Set("Content-Security-Policy", "default-src https:")
-	w.Header().Set("Server", "Apache/2.4")
-	w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 	w.WriteHeader(code)
 	fmt.Fprintln(w, error)
 }
@@ -242,6 +237,7 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 		customNotFound(w, r)
 		return
 	}
+	w.Header().Set("X-Server", config.ServerName) // Useful for checking if this is a GoPhish server (e.g. for campaign reporting plugins)
 	var ptx models.PhishingTemplateContext
 	// Check for a preview
 	if preview, ok := ctx.Get(r, "result").(models.EmailRequest); ok {
@@ -277,24 +273,18 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 		customNotFound(w, r)
 		return
 	}
-	username, password, ok := r.BasicAuth()
-	if !ok {
+	switch {
+	case r.Method == "GET":
 		err = rs.HandleClickedLink(d)
 		if err != nil {
 			log.Error(err)
 		}
-	} else {
-		// d contains a Payload member of type net.url.Values
-		// which itself is just map[string][]string
-		// Manually overwrite it with basic auth data
-		payload := map[string][]string{"Username": []string{username}, "Password": []string{password}}
-		d.Payload = payload
+	case r.Method == "POST":
 		err = rs.HandleFormSubmit(d)
 		if err != nil {
 			log.Error(err)
 		}
 	}
-
 	ptx, err = models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
 	if err != nil {
 		log.Error(err)
@@ -306,52 +296,29 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 // renderPhishResponse handles rendering the correct response to the phishing
 // connection. This usually involves writing out the page HTML or redirecting
 // the user to the correct URL.
-//func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.PhishingTemplateContext, p models.Page) {
-//	// If the request was a form submit and a redirect URL was specified, we
-//	// should send the user to that URL
-//	if r.Method == "POST" {
-//		if p.RedirectURL != "" {
-//			redirectURL, err := models.ExecuteTemplate(p.RedirectURL, ptx)
-//			if err != nil {
-//				log.Error(err)
-//				customNotFound(w, r)
-//				return
-//			}
-//			http.Redirect(w, r, redirectURL, http.StatusFound)
-//			return
-//		}
-//	}
-//	// Otherwise, we just need to write out the templated HTML
-//	html, err := models.ExecuteTemplate(p.HTML, ptx)
-//	if err != nil {
-//		log.Error(err)
-//		customNotFound(w, r)
-//		return
-//	}
-//	w.Write([]byte(html))
-//}
-
-// Modified http auth version
 func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.PhishingTemplateContext, p models.Page) {
-	_, _, ok := r.BasicAuth()
-	// If the request contains a Basic Auth header, send the user to the redirect URL
-	// TODO: Enforce existence of a redirect URL
-	if ok {
-		redirectURL, err := models.ExecuteTemplate(p.RedirectURL, ptx)
-		if err != nil {
-			log.Error(err)
-			customNotFound(w, r)
+	// If the request was a form submit and a redirect URL was specified, we
+	// should send the user to that URL
+	if r.Method == "POST" {
+		if p.RedirectURL != "" {
+			redirectURL, err := models.ExecuteTemplate(p.RedirectURL, ptx)
+			if err != nil {
+				log.Error(err)
+				customNotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, redirectURL, http.StatusFound)
 			return
 		}
-		http.Redirect(w, r, redirectURL, http.StatusFound)
+	}
+	// Otherwise, we just need to write out the templated HTML
+	html, err := models.ExecuteTemplate(p.HTML, ptx)
+	if err != nil {
+		log.Error(err)
+		customNotFound(w, r)
 		return
 	}
-	// Otherwise, send a response containing the WWW-Authenticate header and
-	// render the template as string there
-	stp := bm.StripTagsPolicy()
-	w.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, stp.Sanitize(p.HTML)))
-	w.WriteHeader(http.StatusUnauthorized)
-	w.Write([]byte(`{"message": "You are not authorized to view this page."}`))
+	w.Write([]byte(html))
 }
 
 // RobotsHandler prevents search engines, etc. from indexing phishing materials
